@@ -4,16 +4,18 @@ import sys
 import os
 import re
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import numpy as np
 from chanMonitor import plotEpicsData as ped
 
 id_filt = re.compile(r'^[ ]*([0-9]+) ')
 ts_filt = re.compile(r'[0-9]{4}(-[0-9]{2}){2} [0-9]{2}(:[0-9]{2}){2}.[0-9]{6}')
-search_filt = re.compile(r'Search\(')
+search_filt = re.compile(r'Search\(\'')
 # reply_filt = re.compile(r'(\(13\)|Reply\(1\))[^R]+Reply\(1\)')
-reply_filt = re.compile(r'Reply\(1\)')
+reply_filt = re.compile(r'Search Reply\(1\)')
+conn_filt = re.compile(r'Seq=0 Ack=1')
 seq_filt = re.compile(r'Seq=202 Ack=146')
+dup_filt = re.compile(r'TCP Dup ACK')
 ts_format = '%Y-%m-%d %H:%M:%S.%f'
 
 def parse_args():
@@ -66,8 +68,13 @@ if __name__ == '__main__':
     reply_ca_id = []
     seq_ca_time = []
     seq_ca_id = []
-    lost_req_id = []
-    lost_req_no = []
+    lost_search_id = []
+    lost_search_time = []
+    lost_reply_id = []
+    lost_reply_time = []
+    dup_reply_id = []
+    dup_reply_time = []
+    # lost_req_no = []
     # ws_cap_file = 'tim-capture-text-full.txt'
     ws_cap_file = args.ws_txt_cap
     i = 1
@@ -78,67 +85,108 @@ if __name__ == '__main__':
     for l in ws_cap_data:
         if not(search_filt.search(l)
                or reply_filt.search(l)
-               or seq_filt.search(l)):
+               or seq_filt.search(l)
+               or conn_filt.search(l)):
             continue
-        if search_filt.search(l) and search_flag:
-            continue
-        if reply_filt.search(l) and not(search_flag):
-            continue
-        if seq_filt.search(l) and not(search_flag):
-            continue
+        # if search_filt.search(l) and search_flag:
+            # continue
+        # if reply_filt.search(l) and not(search_flag):
+            # continue
+        # if seq_filt.search(l) and not(search_flag):
+            # continue
         ts_str = ts_filt.search(l).group(0)
         pkg_ts = datetime.strptime(ts_str, ts_format).timestamp()
         pkg_id = id_filt.search(l).group(1)
-        if search_filt.search(l) and not(search_flag):
-            if not(ack_flag) and lost_req_id:
-                lost_req_id.append(request_ca_id.pop())
-                lost_req_no.append(i)
-                request_ca_time.pop()
-                reply_ca_id.pop()
-                reply_ca_time.pop()
+        # print(f"Search flag: {search_flag}")
+        # print(f"Reply flag: {reply_flag}")
+        # print(f"Ack flag: {ack_flag}")
+        # print(f"Prefiltered line: {l}", end='')
+        if search_filt.search(l) and (not(search_flag) or reply_flag):
+            td = pkg_ts - request_ca_time[-1] if request_ca_time else 2
+            if td < 1 and conn_flag:
+                continue
+            if not(ack_flag) and request_ca_id:
+                print("!!!!!!!DELETED FRAME!!!!!!!!!")
+                print(f"Frame: {request_ca_id[-1]}")
+                print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                lost_search_id.append(request_ca_id.pop())
+                # lost_req_no.append(i)
+                lost_search_time.append(request_ca_time.pop())
+                lost_reply_id.append(reply_ca_id.pop())
+                lost_reply_time.append(reply_ca_time.pop())
             request_ca_id.append(pkg_id)
             request_ca_time.append(pkg_ts)
             search_flag = True
             ack_flag = False
             reply_flag = False
-            print(f"********* {i} *************")
-            print(l, end='')
-            i += 1
+            conn_flag = False
+            # print(f"********* {i} *************")
+            # print(l, end='')
             continue
+        # print(l, end='')
         if reply_filt.search(l) and search_flag and not(reply_flag):
             reply_ca_id.append(pkg_id)
             reply_ca_time.append(pkg_ts)
             reply_flag = True
             # search_flag = False
-            print(l, end='')
+            # print(l, end='')
+            # print('++++++++++++++++++++++++++')
             continue
-        seq_ca_id.append(pkg_id)
-        seq_ca_time.append(pkg_ts)
-        print(l, end='')
-        search_flag = False
-        ack_flag = True
-        reply_flag = False
+        if conn_filt.search(l):
+            conn_flag = True
+            continue
+        if seq_filt.search(l) and not(ack_flag):
+            if dup_filt.search(l):
+                dup_reply_id.append(seq_ca_id.pop())
+                dup_reply_time.append(seq_ca_time.pop())
+            seq_ca_id.append(pkg_id)
+            seq_ca_time.append(pkg_ts)
+            # print(l, end='')
+            search_flag = False
+            reply_flag = False
+            conn_flag = False
+            ack_flag = True
+            i += 1
+            continue
+        continue
 
     print(f"Search flag: {search_flag}")
     print(f"req len:{len(request_ca_time)}")
     print(f"reply len:{len(reply_ca_time)}")
     print(f"seq len:{len(seq_ca_time)}")
+    print(f"timestamp: {request_ca_time[1]}")
+    print(f"Total frames: {i}")
     if search_flag:
         del(request_ca_id[-1])
         del(request_ca_time[-1])
     ca_response_time = list(np.subtract(reply_ca_time,request_ca_time))
     ca_full_pkg_time = list(np.subtract(seq_ca_time,request_ca_time))
+    ca_lost_pkg_time = list(np.subtract(lost_reply_time,lost_search_time))
     ca_response_sample = list(range(len(ca_response_time)))
-    ca_response_plt = ped.DataAxePlotter(1)
-    ca_response_plt.Axe['c1']['g1'] = ped.DataAx([ca_response_sample,
+    frtime_fft = ped.fft_generator([np.array(seq_ca_time),
+                                    np.array(ca_full_pkg_time)])
+    ca_response_plt = ped.DataAxePlotter(2)
+    # ca_response_plt.Axe['c1']['g1'] = ped.DataAx([ca_response_sample,
+    ca_response_plt.Axe['c1']['g1'] = ped.DataAx([reply_ca_time,
                                                   ca_response_time],
                                                  'r',
                                                  marker='*',
-                                                 rawx=True)
-    ca_response_plt.Axe['c1']['g2'] = ped.DataAx([ca_response_sample,
+                                                 rawx=False)
+    # ca_response_plt.Axe['c1']['g2'] = ped.DataAx([ca_response_sample,
+    ca_response_plt.Axe['c1']['g2'] = ped.DataAx([seq_ca_time,
                                                   ca_full_pkg_time],
                                                  'g',
                                                  marker='o',
+                                                 rawx=False)
+    ca_response_plt.Axe['c1']['g3'] = ped.DataAx([lost_reply_time,
+                                                  ca_lost_pkg_time],
+                                                 'k',
+                                                 linestyle='',
+                                                 marker='o',
+                                                 rawx=False)
+    ca_response_plt.Axe['c2']['g4'] = ped.DataAx(frtime_fft,
+                                                 'b',
+                                                 standalone=True,
                                                  rawx=True)
     ca_response_plt.positionPlot()
     ca_response_plt.plotConfig()
